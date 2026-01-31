@@ -1,0 +1,1496 @@
+from dataclasses import asdict
+from transformers import HfArgumentParser
+from dataclasses import dataclass, field
+from transformers import TrainingArguments
+from transformers import AutoModelForCausalLM
+from transformers.activations import GELUActivation
+from transformers import LlamaConfig
+from transformers import PretrainedConfig, EvalPrediction
+import math, torch
+from functools import partial
+from torch import nn, Tensor
+from torchvision.transforms.functional import normalize
+from transformers import AutoModel
+from transformers.utils.constants import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
+from peft import LoraConfig, get_peft_model, PeftModel
+from transformers import AutoTokenizer
+from torch.utils.data import ConcatDataset
+from transformers import Trainer, PreTrainedTokenizer
+from transformers.trainer_pt_utils import LabelSmoother
+import os, json, tqdm, random, sys
+import numpy as np
+import Levenshtein
+from numbers import Number
+
+from transformers import LlamaPreTrainedModel
+from transformers.cache_utils import Cache
+from transformers.processing_utils import Unpack
+from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING, KwargsForCausalLM, LlamaModel, _CONFIG_FOR_DOC
+from transformers.generation.utils import GenerationMixin
+from transformers.utils.doc import add_start_docstrings_to_model_forward, replace_return_docstrings
+from typing import List, Optional, Tuple, Union
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+
+from transformers.utils import logging
+logger = logging.get_logger(__name__)
+
+####################################################### args ######################@@@@@@@@@@@#######################
+@dataclass
+class LiveTrainingArguments(TrainingArguments):
+    live_version: str = 'live1+'
+    system_prompt: str = (
+        "A multimodal AI assistant is helping users with some activities."
+        " Below is their conversation, interleaved with the list of video frames received by the assistant."
+    )
+    train_datasets: list[str] = None
+    eval_datasets: list[str] = None
+    stream_loss_weight: float = 1.0
+    llm_pretrained: str = 'meta-llama/Meta-Llama-3-8B-Instruct'#
+    vision_pretrained: str = 'google/siglip-large-patch16-384'
+    lora_modules: str = "model.*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
+    lora_r: int = 128
+    lora_alpha: int = 256
+    finetune_modules: list[str] = field(default_factory=lambda: ['connector', 'class_head', 'task_head', 'cls_emb'])
+    frame_fps: int = 2 # for training. inference can be 10
+    frame_token_cls: bool = None
+    frame_token_pooled: list[int] = None
+    frame_resolution: int = 384
+    frame_token_interval: str  = None
+    frame_token_interval_threshold: float = 0.0
+    augmentation: bool = False
+    attn_implementation: str = 'flash_attention_2'
+    output_dir: str = 'outputs/debug'
+    head_dropout: float = 0.0
+
+@dataclass
+class LiveOneTrainingArguments(LiveTrainingArguments):
+    live_version: str = 'live1'
+    frame_token_cls: bool = True
+    frame_num_tokens: int = 1
+    frame_token_interval: str  = ''
+    embed_mark: str = '2fps_384_1+3x3' #'2fps_384_1'
+    max_num_frames: int = 7200 # 1h, 2fps, 7200 frames
+
+@dataclass
+class LiveOnePlusTrainingArguments(LiveTrainingArguments):
+    live_version: str = 'live1+'
+    frame_token_cls: bool = True
+    frame_token_pooled: list[int] = field(default_factory=lambda: [3,3])
+    frame_num_tokens: int = 10 # 1+3x3
+    embed_mark: str = '2fps_384_1+3x3'
+    frame_token_interval: str = ','
+    max_num_frames: int = 1200 # 10min, 2fps, 1200 frames
+
+def get_args_class(live_version: str):
+    if live_version == 'live1':
+        return LiveOneTrainingArguments
+    elif live_version == 'live1+':
+        return LiveOnePlusTrainingArguments
+    raise NotImplementedError
+
+def parse_args() -> LiveTrainingArguments:
+    args, = HfArgumentParser(LiveTrainingArguments).parse_args_into_dataclasses()
+    args, = HfArgumentParser(get_args_class(args.live_version)).parse_args_into_dataclasses()
+    return args
+
+################################################### vision encoder ###################################################
+class LiveConfigMixin(PretrainedConfig):
+    def __init__(self, *, vision_pretrained: str = None,
+        frame_resolution: int = None, frame_token_cls: bool = None, frame_token_pooled: list[int] = None, frame_num_tokens: int = None,
+        v_placeholder: str = '<v>', frame_token_interval: str = None, v_placeholder_id: int = None, frame_token_interval_id: int = None,
+        stream_loss_weight: float = 1.0, vision_hidden_size=1024, **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.vision_pretrained = vision_pretrained
+        self.frame_resolution = frame_resolution
+        self.frame_token_cls = frame_token_cls
+        self.frame_token_pooled = frame_token_pooled
+        self.frame_num_tokens = frame_num_tokens
+        self.vision_hidden_size = vision_hidden_size
+        self.stream_loss_weight = stream_loss_weight
+        self.v_placeholder = v_placeholder
+        self.frame_token_interval = frame_token_interval
+        self.v_placeholder_id = v_placeholder_id
+        self.frame_token_interval_id = frame_token_interval_id
+
+
+def _siglip_vision_encode(vision_model: nn.Module, frames: Tensor, frame_token_cls: bool, frame_token_pooled: tuple,
+    mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5], rescale_factor=0.00392156862745098, **kwargs):
+    frames = normalize(frames * rescale_factor, mean=mean, std=std)
+    with torch.cuda.amp.autocast():
+        vision_outputs = vision_model(frames)
+        last_hidden_state = vision_outputs.last_hidden_state
+        if frame_token_pooled:
+            s = int(math.sqrt(last_hidden_state.shape[1]))
+            spatial_tokens = torch.nn.functional.adaptive_avg_pool2d(
+                last_hidden_state.reshape(
+                    last_hidden_state.shape[0], s, s, last_hidden_state.shape[-1]
+                ).permute(0, 3, 1, 2),
+                frame_token_pooled
+            ).flatten(2, 3).permute(0, 2, 1)
+            if not frame_token_cls:
+                return spatial_tokens
+        if frame_token_cls:
+            cls_token = vision_outputs.pooler_output[:, None]
+            if not frame_token_pooled:
+                return cls_token
+    return torch.cat([cls_token, spatial_tokens], dim=1)
+
+def _clip_vision_encode(vision_model: nn.Module, frames: Tensor, frame_token_cls: bool, frame_token_pooled: tuple,
+    mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, rescale_factor=0.00392156862745098, **kwargs):
+    frames = normalize(frames * rescale_factor, mean=mean, std=std)
+    with torch.cuda.amp.autocast():
+        vision_outputs = vision_model(frames)
+        last_hidden_state = vision_outputs.last_hidden_state
+        if frame_token_pooled:
+            s = int(math.sqrt(last_hidden_state.shape[1]))
+            spatial_tokens = torch.nn.functional.adaptive_avg_pool2d(
+                last_hidden_state[:,1:].reshape(
+                    last_hidden_state.shape[0], s, s, last_hidden_state.shape[-1]
+                ).permute(0, 3, 1, 2),
+                frame_token_pooled
+            ).flatten(2, 3).permute(0, 2, 1)
+            if not frame_token_cls:
+                return spatial_tokens
+        if frame_token_cls:
+            cls_token = last_hidden_state[:,0]
+            if not frame_token_pooled:
+                return cls_token
+    return torch.cat([cls_token, spatial_tokens], dim=1)
+
+def build_live_vision(config: LiveConfigMixin):
+    model = AutoModel.from_pretrained(config.vision_pretrained).vision_model
+    if 'google/siglip-large-patch16-384' == config.vision_pretrained:
+        return model, partial(_siglip_vision_encode, frame_token_cls=config.frame_token_cls, frame_token_pooled=config.frame_token_pooled)
+    elif 'laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90k' == config.vision_pretrained or 'openai/clip-vit-large-patch14-336' == config.vision_pretrained:
+        return model, partial(_clip_vision_encode, config)
+    else:
+        raise ValueError(f'Unverified vision_pretrained: {config.vision_pretrained}')
+
+####################################################### configure ######################################################
+class LiveLlamaConfig(LlamaConfig, LiveConfigMixin):
+    pass
+
+####################################################### model ######################################################
+class LiveMixin(AutoModelForCausalLM):
+    def set_vision_inside(self):
+        logger.warning_once("!!! Set vision encoder in the model, only recommended for on in-the-wild inference. "
+            "Please dont call this for efficient training & evaluation. Instead, do visual feature pre-extraction.")
+        self.vision_encoder, self.vision_encode = build_live_vision(self.config)
+
+    def unset_vision_inside(self):
+        del self.vision_encoder
+        del self.vision_encode
+
+    def visual_embed(self, frames: torch.Tensor):
+        if hasattr(self, 'vision_encode'):
+            with torch.cuda.amp.autocast():
+                frames = self.vision_encode(self.vision_encoder, frames)
+            frames = frames.to(self.dtype)
+        frames = self.connector(frames)
+        return frames.view(-1, frames.shape[-1])
+
+    def joint_embed(
+        self,
+        input_ids: torch.Tensor = None,
+        frames: torch.Tensor = None,
+    ):
+        if frames is None:
+            return self.get_input_embeddings()(input_ids)
+        if input_ids is None:
+            return self.visual_embed(frames)
+        inputs_embeds = self.get_input_embeddings()(input_ids.clamp(max=self.vocab_size-1))
+        v_mask = input_ids == self.config.v_placeholder_id
+        if v_mask.any():
+            inputs_embeds[v_mask] = self.visual_embed(frames)
+        return inputs_embeds
+
+    @torch.no_grad()
+    def stream_evaluate(
+        self,
+        input_ids: torch.LongTensor,
+        labels: torch.LongTensor,
+        frames: torch.Tensor,
+        ignore_token_id: int = -100,
+        frame_token_interval_threshold: float = 0.0,
+        **kwargs
+    ):
+        # 0. evaluation only supports batch_size = 1
+        assert input_ids.size(0) == labels.size(0) == 1
+        input_id, label = input_ids[0], labels[0]
+        device = input_id.device
+        zero = torch.tensor(0, dtype=torch.int, device=device)
+        one = torch.tensor(1, dtype=torch.int, device=device)
+
+        # 1. prepare multi-turn start and stop
+        turn_stops = ((input_id == self.config.eos_token_id).nonzero() + 1)[:,0].tolist()
+        turn_starts = [0] + turn_stops[:-1]
+        num_turns = len(turn_starts)
+
+        # 2. forward the full input_ids and labels, get tokenwise logits and losses
+        outputs = self.forward(input_ids=input_ids, frames=frames, return_dict=True, use_cache=True)
+        logit, past_key_values = outputs.logits[0], outputs.past_key_values
+
+        # 3. compute metrics for each turn
+        v_placeholder_id = self.config.v_placeholder_id
+        use_interval = self.config.frame_token_interval_id is not None
+        frame_token_interval_id = self.config.frame_token_interval_id if use_interval else self.config.eos_token_id
+        frame_num_tokens = self.config.frame_token_cls
+        if self.config.frame_token_pooled:
+            frame_num_tokens += self.config.frame_token_pooled[0] * self.config.frame_token_pooled[1]
+        past_num_frames = 0
+        lm_ppls, frame_diffs, fluencies, lm_correctness = [], [], [], []
+        for r, (turn_start, turn_stop) in enumerate(zip(turn_starts, turn_stops)):
+            ## 3.1. we only have two losses: stream loss on frame tokens, and lm loss. prepare corresponding mask according two losses
+            turn_label = label[turn_start:turn_stop]
+            turn_learn_mask = turn_label != ignore_token_id
+            if not turn_learn_mask.any():
+                continue
+            turn_logit = logit[turn_start:turn_stop]
+            turn_input_id = input_id[turn_start:turn_stop]
+            turn_v_mask = turn_input_id == v_placeholder_id
+            turn_num_frames = turn_v_mask.sum() // frame_num_tokens
+            turn_stream_mask = turn_v_mask & turn_learn_mask
+            turn_lm_mask = turn_learn_mask & ~turn_stream_mask
+
+            ## 3.2 ppl, offline metric
+            if turn_lm_mask.any():
+                turn_lm_masked_logit, turn_lm_masked_label = turn_logit[turn_lm_mask], turn_label[turn_lm_mask]
+                lm_ppl = torch.nn.functional.cross_entropy(turn_lm_masked_logit, turn_lm_masked_label).exp()
+                lm_ppls.append(lm_ppl)
+                turn_lm_masked_wrong_mask = turn_lm_masked_logit.argmax(dim=-1) != turn_lm_masked_label
+                if turn_lm_masked_wrong_mask.any():
+                    num_lm_correct_tokens = turn_lm_masked_wrong_mask.nonzero()[0,0]
+                else:
+                    num_lm_correct_tokens = (~turn_lm_masked_wrong_mask).sum()
+                lm_correctness.append(num_lm_correct_tokens / turn_lm_masked_label.numel())
+
+            ## 3.3. frame_diff (will be casted to time_diff in compute_metrics)
+            if turn_stream_mask.any():
+                ## 3.3.1: reply before (at) turn_num_frames
+                turn_score = turn_logit.softmax(dim=-1)
+                turn_stream_masked_score = turn_score[turn_stream_mask]
+                if frame_token_interval_threshold > 0:
+                    lower_threshold_mask = turn_stream_masked_score[:, frame_token_interval_id] < frame_token_interval_threshold
+                    turn_stream_masked_score[lower_threshold_mask] = 0
+                turn_stream_masked_pred_mask = turn_stream_masked_score.argmax(dim=-1) != frame_token_interval_id
+                if turn_stream_masked_pred_mask.any():
+                    frame_diff = turn_stream_mask.sum() - turn_stream_masked_pred_mask.nonzero()[0,0] - 1
+                else:
+                    ## 3.3.2: the most complex part,reply after turn_num_frames. we assume the 'assistant: ...' not exists
+                    turn_last_stream_idx = turn_stream_mask.nonzero()[-1,0]
+                    past_key_values_before_assistant = self.trim_past_key_values(past_key_values, 0, turn_start + turn_last_stream_idx + 1)
+                    if r == num_turns - 1: # no future frame. we assume the model should receive a signal when streaming ends (e.g. close button).
+                        frame_diff = zero
+                    else:
+                        next_turn_num_frames = (input_id[turn_starts[r+1]:turn_stops[r+1]] == v_placeholder_id).sum() // frame_num_tokens
+                        to_append_num_frames = min(next_turn_num_frames, turn_num_frames - 1) # avoid bias. current as center, two equal left/right side
+                        if to_append_num_frames == 0:
+                            frame_diff = zero
+                        else:
+                            to_append_frames = frames[past_num_frames+turn_num_frames:past_num_frames+turn_num_frames+to_append_num_frames]
+                            frame_placeholder = [v_placeholder_id] * frame_num_tokens
+                            if use_interval:
+                                frame_placeholder = [frame_token_interval_id] + frame_placeholder
+                            to_append_input_id = torch.tensor(frame_placeholder * to_append_num_frames, dtype=torch.long, device=device)
+                            to_append_logit = self.forward(
+                                input_ids=to_append_input_id[None],
+                                past_key_values=past_key_values_before_assistant,
+                                frames=to_append_frames,
+                                return_dict=True, use_cache=True
+                            ).logits[0]
+                            # we only use the last idx of each frame
+                            idxs = torch.arange(len(frame_placeholder)-1, len(to_append_input_id), len(frame_placeholder), device=device)
+                            to_append_score = to_append_logit[idxs].softmax(dim=-1)
+                            if frame_token_interval_threshold > 0:
+                                lower_threshold_mask = to_append_score[:, frame_token_interval_id] < frame_token_interval_threshold
+                                to_append_score[lower_threshold_mask] = 0
+                            to_append_score_pred_mask = to_append_score.argmax(dim=-1) != frame_token_interval_id
+                            if to_append_score_pred_mask.any():
+                                frame_diff = -(to_append_score_pred_mask.nonzero()[0,0] + 1)
+                            else:
+                                frame_diff = -to_append_num_frames
+                frame_diffs.append(frame_diff.abs())
+
+            ## 2.6 fluency
+            if turn_lm_mask.any() and turn_stream_mask.any():
+                num_learn_v_tokens = turn_stream_mask.sum()
+                num_learn_valid_tokens = turn_lm_masked_label.numel() + num_learn_v_tokens
+                if frame_diff == 0:
+                    fluency = (num_learn_v_tokens + num_lm_correct_tokens) / num_learn_valid_tokens
+                elif frame_diff > 0:
+                    fluency = (num_learn_v_tokens - frame_diff) / num_learn_valid_tokens
+                else:
+                    fluency = (num_learn_v_tokens - 1) / num_learn_valid_tokens
+                fluencies.append(fluency)
+            ## 2.7 next turn
+            past_num_frames += turn_num_frames
+        lm_ppl = torch.stack(lm_ppls).mean() if lm_ppls else one
+        frame_diff = torch.stack(frame_diffs).float().mean() if frame_diffs else zero
+        fluency = torch.stack(fluencies).float().mean() if fluencies else one
+        lm_correctness = torch.stack(lm_correctness).float().mean() if lm_correctness else one
+        return torch.stack([lm_ppl, frame_diff, fluency, lm_correctness])
+
+    def trim_past_key_values(self, past_key_values, start, stop):
+        return [[past_keys[:,:,start:stop], past_values[:,:,start:stop]] for past_keys, past_values in past_key_values]
+
+class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
+    _tied_weights_keys = ["lm_head.weight"]
+    _tp_plan = {"lm_head": "colwise_rep"}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = LlamaModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        num_logits_to_keep: int = 0,
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        r"""
+        Args:
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+            num_logits_to_keep (`int`, *optional*):
+                Calculate logits for the last `num_logits_to_keep` tokens. If `0`, calculate logits for all
+                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
+                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, LlamaForCausalLM
+
+        >>> model = LlamaForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+
+        >>> prompt = "Hey, are you conscious? Can you talk to me?"
+        >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        ```"""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.last_hidden_state, #outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class LiveLlamaForCausalLM(LlamaForCausalLM, LiveMixin):
+    config_class = LiveLlamaConfig
+    _keys_to_ignore_on_load_missing = ['vision_encoder', 'connector', 'class_head', 'task_head', 'cls_emb']
+
+    def __init__(self, config: LiveLlamaConfig):
+        super().__init__(config)
+        self.connector = torch.nn.Sequential(
+            torch.nn.Linear(config.vision_hidden_size, config.hidden_size, bias=True),
+            GELUActivation(config.hidden_size),
+            torch.nn.Linear(config.hidden_size, config.hidden_size, bias=True),
+        )
+        self.class_head = torch.nn.Linear(config.hidden_size, 749, bias=True)
+        self.task_head = torch.nn.Linear(config.hidden_size, 180, bias=True)
+        self.cls_emb = nn.Embedding(1, config.hidden_size)
+        if config.dropout > 0:
+            self.dropout = nn.Dropout(config.dropout)
+        else:
+            self.dropout = None
+
+    def forward(
+            self,
+            input_ids: torch.LongTensor = None,
+            frames: torch.FloatTensor = None,
+            attention_mask: torch.Tensor = None,
+            position_ids: torch.LongTensor = None,
+            past_key_values: list[torch.FloatTensor] = None,
+            inputs_embeds: torch.FloatTensor = None,
+            labels: torch.LongTensor = None,
+            use_cache: bool = None,
+            output_attentions: bool = None,
+            output_hidden_states: bool = None,
+            return_dict: bool = None,
+            cache_position: torch.LongTensor = None,
+            task: str = '',
+            emb_index: torch.LongTensor = None,
+            **kwargs,
+    ):
+        if inputs_embeds is None:
+            assert input_ids.shape[0] == 1, 'only support batch_size = 1. '
+            inputs_embeds = self.joint_embed(input_ids, frames)
+            extra_embeds = self.cls_emb.weight
+            sub_emb_index = []
+            for bz in range(inputs_embeds.shape[0]):
+                v_mask = input_ids[bz, :] == self.config.emb_id
+                assert torch.sum(v_mask) == 1, input_ids
+                inputs_embeds[bz, v_mask, :] = extra_embeds
+                sub_emb_index.append(torch.argmax(v_mask.int()))
+            emb_index = torch.tensor(sub_emb_index).long()
+
+        outputs = super().forward(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            # labels
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        loss = None
+        cls_logits = outputs.hidden_states[torch.arange(len(emb_index)), emb_index, :].unsqueeze(-2)
+        if self.dropout:
+            cls_logits = self.dropout(cls_logits)
+
+        if 'task' == task[0]:
+            cls_logits = self.task_head(cls_logits)
+        else:
+            cls_logits = self.class_head(cls_logits)
+
+        if labels is not None:
+            oh_label = torch.zeros((1, cls_logits.shape[-1])).to(cls_logits.device).float()
+            single_label = labels[0]
+            if isinstance(single_label, Number):
+                oh_label[:, single_label] = 1.0
+            else:
+                rank_label = np.linspace(1/len(set(single_label)), 1, num=len(set(single_label)))[::-1]
+                # TODO: special cases for next n step: A B A C, classificaion can not predict A twice. Currently only count once
+                history, cnt = [], 0
+                for j in range(len(single_label)):
+                    if single_label[j] in history: continue
+                    oh_label[:, single_label[j]] = rank_label[cnt]
+                    history.append(single_label[j])
+                    cnt += 1
+                oh_label = oh_label/ torch.sum(oh_label, dim=-1, keepdim=True)
+
+            logsoftmax = nn.LogSoftmax(dim=-1).to(cls_logits.device)
+            loss = torch.sum(-oh_label * logsoftmax(cls_logits.flatten(0, 1)), dim=-1).mean()
+
+        if not return_dict:
+            return (loss,) + outputs[1:] if loss is not None else outputs
+
+        outputs.loss = loss
+        return outputs
+
+    def generate_after_embed(self, input_ids, frames, **kwargs):
+        inputs_embeds = self.joint_embed(input_ids, frames)
+        extra_embeds = self.cls_emb.weight
+        sub_emb_index = []
+        for bz in range(inputs_embeds.shape[0]):
+            v_mask = input_ids[bz, :] == self.config.emb_id
+            assert torch.sum(v_mask) == 1
+            inputs_embeds[bz, v_mask, :] = extra_embeds
+            sub_emb_index.append(torch.argmax(v_mask.int()))
+        emb_index = torch.tensor(sub_emb_index).long()
+        attention_maks = kwargs.get('attention_mask', None)
+        outputs = super().forward(
+            attention_mask=attention_maks,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=inputs_embeds,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            cache_position=None,
+        )
+        cls_logits = outputs.hidden_states[torch.arange(len(emb_index)), emb_index, :]
+        task = kwargs.get('task', None)
+        assert len(task) == 1
+        if 'task' == task[0]:
+            cls_logits = self.task_head(cls_logits)
+        else:
+            cls_logits = self.class_head(cls_logits)
+
+        if 'procedure' in task[0]:
+            cls_pred = torch.topk(cls_logits.flatten(), 5)[1]
+        else:
+            cls_pred = torch.argmax(cls_logits, dim=-1)
+        return cls_pred
+        # return super().generate(inputs_embeds=self.joint_embed(input_ids, frames), **kwargs)
+
+
+####################################################### tokenizer ######################################################
+def get_stream_placeholder_len(num_frames: int, model_config: LiveConfigMixin) -> str:
+    return num_frames * model_config.frame_num_tokens * len(model_config.v_placeholder) + len(model_config.frame_token_interval) * (num_frames - 1)
+
+def get_stream_placeholder_jinja2(model_config: LiveConfigMixin) -> str:
+    return f"'{model_config.frame_token_interval}'.join([{model_config.frame_num_tokens} * '{model_config.v_placeholder}'] * message['num_frames'])"
+
+def get_stream_learn_ranges(num_frames: int, model_config: LiveConfigMixin) -> torch.Tensor:
+    len_frame_placeholder_with_interval = model_config.frame_num_tokens * len(model_config.v_placeholder) + len(model_config.frame_token_interval)
+    intermediate_interval_idxs = torch.arange(
+        len_frame_placeholder_with_interval,
+        len_frame_placeholder_with_interval * num_frames + 1,
+        len_frame_placeholder_with_interval
+    ) - len(model_config.frame_token_interval)
+    len_learn = len(model_config.frame_token_interval) if model_config.frame_token_interval else len(model_config.v_placeholder)
+    learn_ranges = torch.stack([
+        intermediate_interval_idxs,
+        intermediate_interval_idxs + len_learn
+    ], dim=1)
+    return learn_ranges
+
+def chat_template(self, stream_placeholder_jinja2: str):
+    """
+    system prompt
+    [<v>,<v>,<v>]
+    User: ...
+    Assistant: ...</s>
+    [<v>,<v>]
+    Assistant: ...</s>
+    User: ...
+    Assistant: ...</s>
+    """
+    template = (
+        "{% if messages[0]['role'] == 'system' %}"
+        "{{ bos_token + messages[0]['content'] + '\n' }}" # system
+        "{% set messages = messages[1:] %}"
+        "{% endif %}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'user' %}"
+        "{% if add_stream_query_prompt %}"
+        "{{ ']\nUser: ' + message['content'] }}"
+        "{% else %}"
+        "{{ '\nUser: ' + message['content'] }}"
+        "{% endif %}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ '\nAssistant: '  + message['content'] + eos_token }}"
+        "{% elif message['role'] == 'embed' %}"
+        "{{ '\n<cls>' }}"
+        "{% elif message['role'] == 'stream' and message['num_frames'] > 0: %}"
+        "{{ '\n[' + STREAM_PLACEHOLDER + ']' }}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{ '\nAssistant:' }}"
+        "{% elif add_stream_prompt %}"
+        "{{ '\n[' }}"
+        "{% elif add_stream_generation_prompt %}"
+        "{{ ']\nAssistant:' }}"
+        "{% endif %}"
+    )
+    template = template.replace('STREAM_PLACEHOLDER', stream_placeholder_jinja2)
+    return template
+
+def chat_template_transition(tokenizer):
+    return {
+        (None, 'system'): tokenizer.bos_token,
+        ('system', 'user'): '\n\nUser: ',
+        ('system', 'stream'): '\n\n[',
+        ('user', 'assistant'): '\nAssistant: ',
+        ('user', 'stream'): '\n[',
+        ('user', 'user'): '\nUser: ',
+        ('assistant', 'user'): f'{tokenizer.eos_token}\nUser: ',
+        ('assistant', 'stream'): f'{tokenizer.eos_token}\n[',
+        ('stream', 'user'): ']\nUser: ',
+        ('stream', 'assistant'): ']\nAssistant: ',
+        ('stream', 'embed'): ']\n<cls>',
+        'assistant': 'Assistant: ',
+        'eos_token': tokenizer.eos_token,
+    }
+
+def chat_template_offsets(tokenizer):
+    return {k:len(v) for k, v in chat_template_transition(tokenizer).items()}
+
+def get_learn_ranges(conversation: list[dict], *, chat_template_offsets: dict[tuple, int], model_config: LiveConfigMixin):
+    offset = 0
+    learn_ranges = []
+    last_role = None
+    for message in conversation:
+        role = message['role']
+        offset += chat_template_offsets[(last_role, role)]
+        last_role = role
+        if role == 'stream':
+            if message.get('learn', False):
+                ranges = get_stream_learn_ranges(message['num_frames'], model_config) + offset
+                # the last one has ]\n, should also consider \n
+                ranges[-1, 1] += 1
+                if not isinstance(message['learn'], bool):
+                    ranges = ranges[:message['learn']]
+                learn_ranges.extend([range(r[0], r[1]) for r in ranges])
+            offset += get_stream_placeholder_len(message['num_frames'], model_config)
+            offset += len('<cls>')
+        else:
+            if role == 'assistant':
+                if message.get('learn', False):
+                    learn_ranges.append(range(offset - chat_template_offsets['assistant'], offset + len(message['content']) + chat_template_offsets['eos_token']))
+            offset += len(message['content'])
+    return learn_ranges
+
+
+def build_live_tokenizer_and_update_config(llm_pretrained: str, model_config: LiveConfigMixin) -> AutoTokenizer:
+    tokenizer = AutoTokenizer.from_pretrained(llm_pretrained, use_fast=True, padding_side='left')
+    tokenizer.add_special_tokens({'additional_special_tokens': ['<cls>', model_config.v_placeholder]})
+    emb_id, v_placeholder_id = len(tokenizer) - 2, len(tokenizer) - 1
+    if model_config.frame_token_interval:
+        frame_token_interval_id = tokenizer.convert_tokens_to_ids(model_config.frame_token_interval)
+    else:
+        frame_token_interval_id = None
+    tokenizer.pad_token = tokenizer.eos_token
+    model_config.update(dict(emb_id = emb_id, v_placeholder_id=v_placeholder_id, frame_token_interval_id=frame_token_interval_id, eos_token_id=tokenizer.eos_token_id))
+    tokenizer.chat_template = chat_template(tokenizer, get_stream_placeholder_jinja2(model_config))
+    tokenizer.get_learn_ranges = partial(get_learn_ranges, chat_template_offsets=chat_template_offsets(tokenizer), model_config=model_config)
+    return tokenizer
+
+####################################################### tokenizer + model ######################################################
+def build_live(*, is_training: bool, config_class: type, model_class: type, llm_pretrained: str = None,
+    finetune_modules: list[str] = None, lora_modules: str = None, lora_r: int = None, lora_alpha: int = None, set_vision_inside: bool = False,
+    resume_from_checkpoint: str = '', attn_implementation: str = 'flash_attention_2', torch_dtype: str | torch.dtype = 'auto', **kwargs):
+    config_cls = config_class.from_pretrained(llm_pretrained, **kwargs)
+    config_cls.dropout = kwargs.get('head_dropout', 0.0)
+    model = model_class.from_pretrained(llm_pretrained, config= config_cls, torch_dtype=torch_dtype, attn_implementation=attn_implementation)
+    tokenizer = build_live_tokenizer_and_update_config(llm_pretrained, model.config)
+    if is_training:
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_modules,
+            lora_dropout=0.05,
+            task_type="CAUSAL_LM",
+            modules_to_save=finetune_modules,
+            inference_mode=False,
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+    else:
+        if resume_from_checkpoint:
+            model = PeftModel.from_pretrained(model, resume_from_checkpoint, is_trainable=False)
+        else:
+            logger.warning(f'!!! Fail to load checkpoint: {resume_from_checkpoint}. Return a new initialized model.')
+        if set_vision_inside:
+            model.set_vision_inside()
+        model.requires_grad_(False)
+    return model, tokenizer
+
+
+def build_model_and_tokenizer(**kwargs):
+    return build_live(config_class=LiveLlamaConfig, model_class=LiveLlamaForCausalLM, **kwargs)
+
+####################################################### data ######################################################
+def ceil_time_by_fps(time: float, fps: int, min_time: float, max_time: float):
+    return min(max(math.ceil(time * fps) / fps, min_time), max_time)
+
+def rand_bool():
+    return bool(random.getrandbits(1))
+
+class DictWithTo(dict):
+    def to(self, *args, **kwargs):
+        return self
+
+class StreamMixIn(torch.utils.data.Dataset):
+    def __init__(self, is_training: bool, system_prompt: str, augmentation: bool, max_num_frames: int,
+                 tokenizer: PreTrainedTokenizer, **kwargs):
+        super().__init__()
+        self.is_training = is_training
+        self.system_prompt = system_prompt
+        self.augmentation = augmentation
+        self.tokenizer = tokenizer
+        self.max_num_frames = max_num_frames
+        assert system_prompt is not None, 'Please add a system prompt'
+
+    # NOTE: this augmentation is to reduce the text dependency
+    def augment(self, conversation):
+        if not self.augmentation or not self.is_training:
+            return conversation
+        assistant_messages = [(i, message) for i, message in enumerate(conversation) if
+                              message['role'] == 'assistant' and message.get('learn', False)]
+        if len(assistant_messages) <= 1:
+            return conversation
+        i, assistant_message_i = random.choice(
+            assistant_messages[:-1])  # do not choose the last one, since its meaningless to dependency
+        real_content = assistant_message_i['content']
+        fake_contents = list(
+            set(message['content'] for _, message in assistant_messages if message['content'] != real_content)) + [
+                            ''] + [None]
+        fake_content = random.choice(fake_contents)
+        fake_message_i = {'role': 'assistant', 'content': fake_content,
+                          'learn': False} if fake_content is not None else None
+        if rand_bool():  # fix the wrong content at the next frame
+            # case1: ... fake_message, frame, real_message, stream - 1 ...
+            if fake_message_i is not None and conversation[i + 1]['role'] == 'stream' and conversation[i + 1][
+                'num_frames'] > 1:
+                conversation = conversation[:i] + [
+                    fake_message_i,
+                    {'role': 'stream', 'num_frames': 1, 'learn': True},
+                    {'role': 'assistant', 'content': f'(Sorry, the last response is wrong) {real_content}',
+                     'learn': True},
+                    {'role': 'stream', 'num_frames': conversation[i + 1]['num_frames'] - 1, 'learn': True}
+                ] + conversation[i + 2:]
+            # case2: ... stream + 1, real_message, stream -1, ...
+            elif fake_message_i is None and conversation[i - 1]['role'] == 'stream' and conversation[i + 1][
+                'role'] == 'stream' and conversation[i + 1]['num_frames'] > 1:
+                conversation = conversation[:i - 1] + [
+                    {'role': 'stream', 'num_frames': conversation[i - 1]['num_frames'] + 1,
+                     'learn': conversation[i - 1]['num_frames'] - 1},
+                    {'role': 'assistant', 'content': real_content, 'learn': True},
+                    {'role': 'stream', 'num_frames': conversation[i + 1]['num_frames'] - 1, 'learn': True}
+                ] + conversation[i + 2:]
+        else:  # not fix
+            # case3: ... fake_message, stream (unlearn) / message ...
+            if fake_message_i is not None:
+                if conversation[i + 1]['role'] == 'stream':
+                    conversation = conversation[:i] + [
+                        fake_message_i,
+                        {'role': 'stream', 'num_frames': conversation[i + 1]['num_frames'], 'learn': False},
+                    ] + conversation[i + 2:]
+                else:
+                    conversation = conversation[:i] + [fake_message_i] + conversation[i + 1:]
+            # case4: ... stream (learn-1), stream (unlearn) / message ...
+            else:
+                if conversation[i - 1]['role'] == 'stream':
+                    if conversation[i + 1]['role'] != 'stream':
+                        conversation = conversation[:i - 1] + [
+                            {'role': 'stream', 'num_frames': conversation[i - 1]['num_frames'],
+                             'learn': conversation[i - 1]['num_frames'] - 1},
+                        ] + conversation[i + 1:]
+                    else:
+                        conversation = conversation[:i - 1] + [
+                            {'role': 'stream',
+                             'num_frames': conversation[i - 1]['num_frames'] + conversation[i + 1]['num_frames'],
+                             'learn': conversation[i - 1]['num_frames'] - 1},
+                        ] + conversation[i + 2:]
+                else:
+                    if conversation[i + 1]['role'] == 'stream':
+                        conversation = conversation[:i] + [
+                            {'role': 'stream', 'num_frames': conversation[i + 1]['num_frames'], 'learn': False},
+                        ] + conversation[i + 2:]
+                    else:
+                        conversation = conversation[:i] + conversation[i + 1:]
+        return conversation
+
+    def max_frames_clip(self, conversation: list[dict], load_ranges: dict[str, range], max_num_frames: int):
+        # TODO: currently only fit one round of stream
+        for i, message in enumerate(conversation):
+            if message['role'] == 'stream':
+                if message['num_frames'] > max_num_frames:
+                    message['num_frames'] = max_num_frames
+                    load_ranges = {path: range(ranger.start, ranger.start + max_num_frames) for path, ranger in
+                                   load_ranges.items()}
+        return conversation, load_ranges
+
+    def __getitem__(self, *, conversation: list[dict], load_ranges: dict[str, range] | torch.Tensor = None,
+                    task: str, label: list,  add_generation_prompt=False, **kwargs):
+        # 1. load visual encoding
+        if isinstance(load_ranges, torch.Tensor):
+            frames = load_ranges
+        elif load_ranges is not None:
+            conversation, load_ranges = self.max_frames_clip(conversation, load_ranges, self.max_num_frames)
+            frames = torch.cat([torch.load(path, weights_only=True)[ranger] for path, ranger in load_ranges.items()])
+        else:
+            frames = torch.tensor([])
+        # 2. prepare texts
+        if self.augmentation:
+            conversation = self.augment(conversation)
+        conversation = [{"role": "system", "content": self.system_prompt}] + conversation
+        text = self.tokenizer.apply_chat_template(conversation, tokenize=False,
+                                                  add_generation_prompt=add_generation_prompt)
+        # 3. learn ranges
+        learn_ranges = self.tokenizer.get_learn_ranges(conversation) if not add_generation_prompt else []
+        # print(text)
+        # for i in range(len(learn_ranges)):
+        #     print(i, text[learn_ranges[i].start: learn_ranges[i].stop])
+        return text, frames, learn_ranges, task, label
+
+class COIN:
+    root = 'datasets/coin'
+    video_root = os.path.join(root, 'videos')
+    anno_root = os.path.join(root, 'annotations')
+
+    def __init__(self, split: str, vision_pretrained: str, embed_mark: str, frame_fps: int, **kwargs):
+        super().__init__(**kwargs)
+        self.embed_dir = f"{self.video_root}_{embed_mark}_{vision_pretrained.replace('/', '--')}"
+        self.frame_fps = frame_fps
+        self.metadata = self.get_metadata()
+        annos = json.load(open(os.path.join(self.root, 'coin.json')))['database']
+        assert split in ['train', 'test']
+        self._annos = [{
+            'video_uid': video_uid,
+            'task': COIN._clean_task(anno['class']),
+            'start': anno['start'],
+            'end': anno['end'],
+            'steps': [dict(
+                start=step['segment'][0],
+                end=step['segment'][1],
+                text=COIN._clean_step(step['label']),
+            ) for step in anno['annotation']],
+        #} for video_uid, anno in annos.items() if (video_uid in self.metadata)]
+        } for video_uid, anno in annos.items() if (split in anno['subset'].lower()) and (video_uid in self.metadata)]
+        self.task_categories = list(set([v['task'].lower() for v in self._annos]))
+        self.step_categories = list(set([step['text'].lower() for steps in self._annos for step in steps['steps']]))
+        # class_names = sorted(self.step_categories)
+        # task_names = sorted(self.task_categories)
+        # save_dict = {'class_name': class_names, 'task_name': task_names}
+        # with open("datasets/coin/labels.json", "w", encoding="utf-8") as f:
+        #     json.dump(save_dict, f, indent=4, ensure_ascii=False)
+        with open("datasets/coin/labels.json", "r") as f:
+            names = json.load(f)
+            self.class_names = names['class_name']
+            self.task_names = names['task_name']
+
+        self.annos: list[dict]
+
+    def get_metadata(self, ):
+        metadata_path = f'{self.embed_dir}_metadata.json'
+        if os.path.exists(metadata_path):
+            print(f'load {metadata_path}...')
+            metadata = json.load(open(metadata_path))
+        else:
+            metadata = {}
+            for file in tqdm.tqdm(os.listdir(self.embed_dir), desc=f'prepare {metadata_path}...'):
+                path = os.path.join(self.embed_dir, file)
+                duration = (len(torch.load(path)) - 1) / self.frame_fps
+                key = os.path.splitext(os.path.basename(path))[0]
+                metadata[key] = {'duration': duration, 'path': path}
+            json.dump(metadata, open(metadata_path, 'w'), indent=4)
+        return metadata
+
+    @staticmethod
+    def _clean_step(step):
+        replaces = {
+            'process (crop, fold) paper': 'crop and fold paper',
+            'try to press gun head, spray residual old grease': 'try to press gun head to spray residual old grease'
+        }
+        return replaces.get(step, step)
+
+    # PutOnHair -> put on hair
+    @staticmethod
+    def _clean_task(text):
+        result = ''
+        for char in text:
+            if char.isupper():
+                result += ' ' + char.lower()
+            else:
+                result += char
+        result = result.replace(' t v', ' TV')
+        result = result.replace(' c d', ' CD')
+        result = result.replace('s i m', 'SIM')
+        result = result.replace('n b a', 'NBA')
+        result = result.replace('s s d', 'SSD')
+        result = result.replace('r j45', 'RJ45')
+        return result.strip()
+
+    def __len__(self):
+        return len(self.annos)
+
+class COINBenchmark(COIN, StreamMixIn):
+    evaluation_kwargs = DictWithTo(evaluator='generate_after_embed', max_new_tokens=512, do_sample=False, use_cache=True, temperature=1.0, top_p=1.0)
+
+    @staticmethod
+    def fuzzy_match(text, choices):
+        return min([(Levenshtein.distance(text, choice), choice) for choice in choices])[1]
+
+    def compute_metrics(self, eval_predictions: EvalPrediction, tokenizer: PreTrainedTokenizer, **kwargs):
+        predictions, sample_idxs = eval_predictions.predictions, eval_predictions.label_ids
+        correct = 0
+        for prediction, label in zip(predictions, self.labels[sample_idxs]):
+            if prediction[0] == label:
+                correct += 1
+        return dict(accuracy=correct / len(predictions) * 100) # * 100
+
+    def __getitem__(self, index):
+        anno = self.annos[index]
+        task, label = anno['type'], anno['label']
+        conversation = anno['conversation']# if not training, do not include the assistant message
+        return *super().__getitem__(conversation=conversation, load_ranges=anno['load_ranges'], task=task, label=label,
+                                    add_generation_prompt=False), index, self.evaluation_kwargs
+
+class COINStep(COINBenchmark):
+    user_message = {
+        "role": "user",
+        "content": 'What is the action in the video? Format your answer concisely. No extra text output.'
+    }
+    def __init__(self, *, split: str, frame_fps: int, is_training: bool, **kwargs):
+        super().__init__(split=split, frame_fps=frame_fps, is_training=is_training, **kwargs)
+        self.is_training = is_training
+        self.frame_fps = frame_fps
+        self.annos, self.labels = [], []
+        for anno in self._annos:
+            video_uid = anno['video_uid']
+            duration = self.metadata[video_uid]['duration']
+            steps = anno['steps']
+            for i in range(len(steps)):
+                response = steps[i]['text'].capitalize() + '.'
+                num_label = self.class_names.index(steps[i]['text'].lower())
+                self.labels.append(num_label)
+                start_time = ceil_time_by_fps(steps[i]['start'], frame_fps, min_time=0, max_time=duration)
+                end_time = ceil_time_by_fps(steps[i]['end'], frame_fps, min_time=0, max_time=duration)
+                start_frame = int(start_time * frame_fps)
+                end_frame = int(end_time * frame_fps) + 1
+                conversation = [
+                    COINStep.user_message,
+                    {"role": "stream", 'num_frames': end_frame - start_frame, 'learn': True},
+                    #{"role": "assistant", "content": response, 'learn': True},
+                    {"role": "embed", "content": ''}
+                ]
+                self.annos.append({
+                    'conversation': conversation,
+                    'load_ranges': {self.metadata[video_uid]['path']: range(start_frame, end_frame)},
+                    'label': num_label,
+                    'type': 'step'
+                })
+        self.labels = np.array(self.labels) # for fast indexing
+        self.categories = self.step_categories
+
+def build_coin_step_train(**kwargs):
+    return COINStep(split='train', **kwargs)
+
+def build_coin_step_test(**kwargs):
+    return COINStep(split='test', **kwargs)
+
+class COINNext(COINBenchmark):
+    user_message = {
+        "role": "user",
+        "content": 'What is the next action for the video? Format your answer concisely. No extra text output.'
+    }
+    def __init__(self, *, split: str, frame_fps: int, is_training: bool, **kwargs):
+        super().__init__(split=split, frame_fps=frame_fps, is_training=is_training, **kwargs)
+        self.is_training = is_training
+        self.frame_fps = frame_fps
+        self.annos, self.labels = [], []
+        for anno in self._annos:
+            video_uid = anno['video_uid']
+            duration = self.metadata[video_uid]['duration']
+            steps = anno['steps']
+            for i in range(len(steps) - 1):
+                response = steps[i+1]['text'].capitalize() + '.'
+                # self.labels.append(steps[i + 1]['text'].lower())
+                num_label = self.class_names.index(steps[i+1]['text'].lower())
+                self.labels.append(num_label)
+                start_time = ceil_time_by_fps(steps[i]['start'], frame_fps, min_time=0, max_time=duration)
+                end_time = ceil_time_by_fps(steps[i]['end'], frame_fps, min_time=0, max_time=duration)
+                start_frame = int(start_time * frame_fps)
+                end_frame = int(end_time * frame_fps) + 1
+                conversation = [
+                    COINNext.user_message,
+                    {"role": "stream", 'num_frames': end_frame - start_frame, 'learn': True},
+                    # {"role": "assistant", "content": response, 'learn': True},
+                    {"role": "embed", "content": ''}
+                ]
+                self.annos.append({
+                    'conversation': conversation,
+                    'load_ranges': {self.metadata[video_uid]['path']: range(start_frame, end_frame)},
+                    'label': num_label,
+                    'type': 'next'
+                })
+        self.labels = np.array(self.labels) # for fast indexing
+        self.categories = self.step_categories
+
+def build_coin_next_train(**kwargs):
+    return COINNext(split='train', **kwargs)
+
+def build_coin_next_test(**kwargs):
+    return COINNext(split='test', **kwargs)
+
+class COINTask(COINBenchmark):
+    user_message = {
+        "role": "user",
+        "content": 'What is the overall activity in the video? Format your answer concisely. No extra text output.'
+    }
+    def __init__(self, *, split: str, frame_fps: int, is_training: bool, **kwargs):
+        super().__init__(split=split, frame_fps=frame_fps, is_training=is_training, **kwargs)
+        self.is_training = is_training
+        self.frame_fps = frame_fps
+        self.annos, self.labels = [], []
+        for anno in self._annos:
+            video_uid = anno['video_uid']
+            duration = self.metadata[video_uid]['duration']
+            response = anno['task'].capitalize() + '.'
+            # self.labels.append(anno['task'].lower())
+            num_label = self.task_names.index(anno['task'].lower())
+            self.labels.append(num_label)
+            start_time = ceil_time_by_fps(anno['start'], frame_fps, min_time=0, max_time=duration)
+            end_time = ceil_time_by_fps(anno['end'], frame_fps, min_time=0, max_time=duration)
+            start_frame = int(start_time * frame_fps)
+            end_frame = int(end_time * frame_fps) + 1
+            conversation = [
+                COINTask.user_message,
+                {"role": "stream", 'num_frames': end_frame - start_frame, 'learn': True},
+                # {"role": "assistant", "content": response, 'learn': True},
+                {"role": "embed", "content": ''}
+            ]
+            self.annos.append({
+                'conversation': conversation,
+                'load_ranges': {self.metadata[video_uid]['path']: range(start_frame, end_frame)},
+                'label': num_label,
+                'type': 'task'
+            })
+        self.labels = np.array(self.labels) # for fast indexing
+        self.categories = self.task_categories
+
+def build_coin_task_train(**kwargs):
+    return COINTask(split='train', **kwargs)
+
+def build_coin_task_test(**kwargs):
+    return COINTask(split='test', **kwargs)
+
+####################################################### dataloader ######################################################
+def data_collator(batch: list[list], *, tokenizer: PreTrainedTokenizer, **kwargs):
+    batch = list(zip(*batch))
+    batch_text, batch_frames, batch_learn_ranges, batch_task, batch_num_label, batch_sample_idx, batch_evaluation_kwargs = batch
+    # print(batch_text)
+    batch = tokenizer(batch_text, return_offsets_mapping=True, add_special_tokens=False, return_tensors="pt", padding=True)
+    batch_labels = torch.full_like(batch.input_ids, LabelSmoother.ignore_index, dtype=torch.long)
+    for text, labels, input_ids, offset_mapping, learn_range in zip(
+        batch_text, batch_labels, batch.input_ids, batch.offset_mapping, batch_learn_ranges
+    ):
+        for learn_r in learn_range:
+            start = torch.nonzero(offset_mapping[:,0] == learn_r.start).item()
+            if offset_mapping[:,0][-1] >= learn_r.stop:
+                stop = torch.nonzero(offset_mapping[:,0] == learn_r.stop).item()
+            else: # the last eos token
+                stop = len(input_ids)
+            labels[start-1:stop-1] = input_ids[start:stop]
+            # NOTE: input_ids may out of boundary of len(tokenizer) - 1. (1 is the added vision placeholder)
+            # this is because some frames has v_placeholder_id target. so replace it with eos token.
+            labels[labels >= len(tokenizer) - 1] = tokenizer.eos_token_id
+    batch['labels'] = batch_num_label #batch_labels
+    batch['task'] = batch_task
+    batch.pop('offset_mapping')
+    batch['frames'] = torch.cat(batch_frames)
+    batch['sample_idxs'] = torch.tensor(batch_sample_idx)
+    if batch_evaluation_kwargs[0]:
+        batch['evaluation_kwargs'] = batch_evaluation_kwargs[0] # evaluation only supports bs = 1, so its okay
+    return batch
+
+def get_data_collator(**kwargs):
+    return partial(data_collator, **kwargs)
+
+def get_compute_metrics_dict( dataset_dict: dict,  **kwargs):
+    if not dataset_dict:
+        return None
+    # add eval_ since transformers default metrics prefix is eval
+    return {k: partial(v.compute_metrics, **kwargs) for k, v in dataset_dict.items()}
+
+def _build_list_datasets(datasets: list, is_training: bool, **kwargs):
+    # tokenizer will be changed (e.g., add tokens) during this process
+    datasets = [
+        globals()[f"build_{dataset}"](
+            is_training=is_training,
+            **kwargs
+        ) for dataset in datasets
+    ]
+    return datasets
+
+def build_concat_train_dataset(train_datasets: list, is_training=True, **kwargs):
+    if train_datasets is None or len(train_datasets) == 0:
+        return None
+    return ConcatDataset(_build_list_datasets(datasets=train_datasets, is_training=is_training, **kwargs))
+
+def build_eval_dataset_dict(eval_datasets: list, is_training=False, **kwargs):
+    if eval_datasets is None or len(eval_datasets) == 0:
+        return None
+    list_datasets = _build_list_datasets(datasets=eval_datasets, is_training=is_training, **kwargs)
+    return {name:dataset for name, dataset in zip(eval_datasets, list_datasets)}
+
+####################################################### trainer ######################################################
+import time
+from transformers.trainer import EvalLoopOutput, DataLoader, deepspeed_init, has_length, EvalLoopContainer, find_batch_size
+from transformers.trainer import is_torch_xla_available, denumpify_detensorize, IterableDatasetShard
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+class TrainerWithGenToEval(Trainer):
+
+    def evaluation_loop(
+        self,
+        dataloader: DataLoader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> EvalLoopOutput:
+        """
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+        args = self.args
+
+        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
+
+        # if eval is called w/o train, handle model prep here
+        if self.is_deepspeed_enabled and self.deepspeed is None:
+            _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
+
+        model = self._wrap_model(self.model, training=False, dataloader=dataloader)
+
+        if len(self.accelerator._models) == 0 and model is self.model:
+            start_time = time.time()
+            model = (
+                self.accelerator.prepare(model)
+                if self.is_deepspeed_enabled or self.is_fsdp_enabled
+                else self.accelerator.prepare_model(model, evaluation_mode=True)
+            )
+            self.model_preparation_time = round(time.time() - start_time, 4)
+
+            if self.is_fsdp_enabled:
+                self.model = model
+
+            # for the rest of this function `model` is the outside model, whether it was wrapped or not
+            if model is not self.model:
+                self.model_wrapped = model
+
+            # backward compatibility
+            if self.is_deepspeed_enabled:
+                self.deepspeed = self.model_wrapped
+
+        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
+        # while ``train`` is running, cast it to the right dtype first and then put on device
+        if not self.is_in_train:
+            if args.fp16_full_eval:
+                model = model.to(dtype=torch.float16, device=args.device)
+            elif args.bf16_full_eval:
+                model = model.to(dtype=torch.bfloat16, device=args.device)
+
+        batch_size = self.args.eval_batch_size
+
+        logger.info(f"\n***** Running {description} *****")
+        if has_length(dataloader):
+            logger.info(f"  Num examples = {self.num_examples(dataloader)}")
+        else:
+            logger.info("  Num examples: Unknown")
+        logger.info(f"  Batch size = {batch_size}")
+
+        model.eval()
+        if hasattr(self.optimizer, "eval") and callable(self.optimizer.eval):
+            self.optimizer.eval()
+
+        self.callback_handler.eval_dataloader = dataloader
+        # Do this before wrapping.
+        eval_dataset = getattr(dataloader, "dataset", None)
+
+        if args.past_index >= 0:
+            self._past = None
+
+        # Initialize containers
+        all_losses = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+        all_preds = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+        all_labels = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+        all_inputs = EvalLoopContainer(self.args.eval_do_concat_batches, padding_index=-100)
+
+        metrics = None
+        eval_set_kwargs = {}
+
+        # Will be useful when we have an iterable dataset so don't know its length.
+        observed_num_examples = 0
+
+        # Main evaluation loop
+        for step, inputs in enumerate(dataloader):
+            # Update the observed num examples
+            observed_batch_size = find_batch_size(inputs)
+            if observed_batch_size is not None:
+                observed_num_examples += observed_batch_size
+                # For batch samplers, batch_size is not known by the dataloader in advance.
+                if batch_size is None:
+                    batch_size = observed_batch_size
+
+            # Prediction step
+            losses, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+            main_input_name = getattr(self.model, "main_input_name", "input_ids")
+            inputs_decode = (
+                self._prepare_input(inputs[main_input_name]) if "inputs" in args.include_for_metrics else None
+            )
+
+            if is_torch_xla_available():
+                xm.mark_step()
+
+            # Update containers
+            if losses is not None:
+                losses = self.gather_function((losses.repeat(batch_size)))
+                all_losses.add(losses)
+            if inputs_decode is not None:
+                inputs_decode = self.accelerator.pad_across_processes(inputs_decode, dim=1, pad_index=-100)
+                inputs_decode = self.gather_function((inputs_decode))
+                if not self.args.batch_eval_metrics or description == "Prediction":
+                    all_inputs.add(inputs_decode)
+            if labels is not None:
+                # Pad labels here, preparing for preprocess_logits_for_metrics in next logits block.
+                labels = self.accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+            if logits is not None:
+                logits = self.accelerator.pad_across_processes(logits, dim=1, pad_index=-100)
+                if self.preprocess_logits_for_metrics is not None:
+                    logits = self.preprocess_logits_for_metrics(logits, labels)
+                logits = self.gather_function((logits))
+                if not self.args.batch_eval_metrics or description == "Prediction":
+                    all_preds.add(logits)
+            if labels is not None:
+                labels = self.gather_function((labels))
+                if not self.args.batch_eval_metrics or description == "Prediction":
+                    all_labels.add(labels)
+
+            self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+
+            if self.args.batch_eval_metrics:
+                if self.compute_metrics is not None and logits is not None and labels is not None:
+                    is_last_step = self.accelerator.gradient_state.end_of_dataloader
+                    batch_kwargs = {}
+                    batch_kwargs["losses"] = losses if "loss" in args.include_for_metrics else None
+                    batch_kwargs["inputs"] = inputs if "inputs" in args.include_for_metrics else None
+                    metrics = self.compute_metrics(
+                        EvalPrediction(predictions=logits, label_ids=labels, **batch_kwargs),
+                        compute_result=is_last_step,
+                    )
+
+                del losses, logits, labels, inputs
+                torch.cuda.empty_cache()
+
+            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+            elif args.eval_accumulation_steps is not None and (step + 1) % args.eval_accumulation_steps == 0:
+                all_losses.to_cpu_and_numpy()
+                all_preds.to_cpu_and_numpy()
+                all_labels.to_cpu_and_numpy()
+                all_inputs.to_cpu_and_numpy()
+
+                del losses, logits, labels, inputs
+                torch.cuda.empty_cache()
+
+        # After all calls to `.gather_function`, reset to `gather_for_metrics`:
+        self.gather_function = self.accelerator.gather_for_metrics
+        if args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+
+        # Gather all remaining tensors and put them back on the CPU
+        all_losses = all_losses.get_arrays()
+        all_preds = all_preds.get_arrays()
+        all_labels = all_labels.get_arrays()
+        all_inputs = all_inputs.get_arrays()
+
+        # Number of samples
+        if has_length(eval_dataset):
+            num_samples = len(eval_dataset)
+        # The instance check is weird and does not actually check for the type, but whether the dataset has the right
+        # methods. Therefore we need to make sure it also has the attribute.
+        elif isinstance(eval_dataset, IterableDatasetShard) and getattr(eval_dataset, "num_examples", 0) > 0:
+            num_samples = eval_dataset.num_examples
+        else:
+            if has_length(dataloader):
+                num_samples = self.num_examples(dataloader)
+            else:  # both len(dataloader.dataset) and len(dataloader) fail
+                num_samples = observed_num_examples
+        if num_samples == 0 and observed_num_examples > 0:
+            num_samples = observed_num_examples
+
+        # Metrics!
+        if (
+            self.compute_metrics is not None
+            and all_preds is not None
+            and all_labels is not None
+            and not self.args.batch_eval_metrics
+        ):
+            eval_set_kwargs["losses"] = all_losses if "loss" in args.include_for_metrics else None
+            eval_set_kwargs["inputs"] = all_inputs if "inputs" in args.include_for_metrics else None
+            metrics = self.compute_metrics(
+                EvalPrediction(predictions=all_preds, label_ids=all_labels, **eval_set_kwargs)
+            )
+        elif metrics is None:
+            metrics = {}
+
+        # To be JSON-serializable, we need to remove numpy types or zero-d tensors
+        metrics = denumpify_detensorize(metrics)
+
+        if isinstance(all_losses, list) and all_losses:
+            metrics[f"{metric_key_prefix}_loss"] = np.concatenate(all_losses).mean().item()
+        elif isinstance(all_losses, np.ndarray):
+            metrics[f"{metric_key_prefix}_loss"] = all_losses.mean().item()
+        if hasattr(self, "jit_compilation_time"):
+            metrics[f"{metric_key_prefix}_jit_compilation_time"] = self.jit_compilation_time
+        if hasattr(self, "model_preparation_time"):
+            metrics[f"{metric_key_prefix}_model_preparation_time"] = self.model_preparation_time
+
+        # Prefix all keys with metric_key_prefix + '_'
+        for key in list(metrics.keys()):
+            if not key.startswith(f"{metric_key_prefix}_"):
+                metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
+
+        return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples)
+
+    def prediction_step(
+        self,
+        model: torch.nn.Module,
+        inputs: dict,
+        prediction_loss_only: bool,
+        ignore_keys: list[str] = None,
+    ):
+        with torch.no_grad(), self.compute_loss_context_manager():
+            inputs = self._prepare_inputs(inputs)
+            if prediction_loss_only:
+                loss = self.compute_loss(model, inputs, return_outputs=False)
+                return (loss, None, None)
+            sample_idxs = inputs.pop('sample_idxs')
+            evaluation_kwargs = inputs.pop('evaluation_kwargs')
+            evaluator = evaluation_kwargs.pop('evaluator')
+            output_ids = getattr(model, evaluator)(**inputs, **evaluation_kwargs, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
+            return (None, output_ids.reshape(1, -1), sample_idxs)
+
+def train():
+    args = parse_args()
+    #args.use_cpu = True
+    model, tokenizer = build_model_and_tokenizer(is_training=True, **asdict(args))
+    # a = {}
+    # for name, param in model.named_parameters():
+    #     if param.requires_grad:
+    #         a[name] = param
+    train_dataset = build_concat_train_dataset(tokenizer=tokenizer, **asdict(args))
+    eval_dataset_dict = build_eval_dataset_dict(tokenizer=tokenizer, **asdict(args))
+    data_collator = get_data_collator(tokenizer=tokenizer, **asdict(args))
+    compute_metrics_dict = get_compute_metrics_dict(dataset_dict=eval_dataset_dict, tokenizer=tokenizer, **asdict(args))
+
+    args.gradient_checkpointing_kwargs = {'use_reentrant': False}
+    trainer = TrainerWithGenToEval(
+        model=model, tokenizer=tokenizer,
+        args=args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset_dict,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics_dict,
+    )
+    trainer.train()
+    trainer.save_model()
+
+    if eval_dataset_dict is not None:
+        metrics = {}
+        for eval_dataset_name, eval_dataset in eval_dataset_dict.items():
+            trainer.compute_metrics = compute_metrics_dict[eval_dataset_name]
+            metrics.update(
+                trainer.evaluate(
+                    eval_dataset=eval_dataset,
+                    metric_key_prefix=f"eval_{eval_dataset_name}",
+                )
+            )
+        print(metrics)
+
+
+def evaluate():
+    args = parse_args()
+    model, tokenizer = build_model_and_tokenizer(is_training=False, **asdict(args))
+    eval_dataset_dict = build_eval_dataset_dict(tokenizer=tokenizer, model_config=model.config, **asdict(args))
+    data_collator = get_data_collator(tokenizer=tokenizer, model_config=model.config, **asdict(args))
+    compute_metrics_dict = get_compute_metrics_dict(dataset_dict=eval_dataset_dict, tokenizer=tokenizer, **asdict(args))
+
+    trainer = TrainerWithGenToEval(
+        model=model, tokenizer=tokenizer,
+        args=args,
+        eval_dataset=eval_dataset_dict,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics_dict,
+    )
+
+    metrics = {}
+    for eval_dataset_name, eval_dataset in eval_dataset_dict.items():
+        trainer.compute_metrics = compute_metrics_dict[eval_dataset_name]
+        dataset_metrics = trainer.evaluate(
+            eval_dataset=eval_dataset,
+            metric_key_prefix=f"eval_{eval_dataset_name}",
+        )
+        metrics.update(dataset_metrics)
+    print(metrics)
+
+    final_results = {'Checkpoints': args.resume_from_checkpoint}
+    tasks = ['step_test_accuracy', 'next_test_accuracy', 'task_test_accuracy']
+    for t in tasks:
+        task_name = ' ' + t.replace('_test_accuracy', '')
+        for metric in metrics.keys():
+            if t in metric:
+                final_results[task_name] = metrics[metric]
+                break
+        if task_name not in final_results:
+            final_results[task_name] = -1
+
+    import pandas as pd
+    df = pd.DataFrame([final_results])
+
+    head = True
+    if os.path.exists('coin_results.csv'):
+        head = False
+    df.to_csv('coin_results.csv', mode='a', index=False, header=head, float_format='%.1f')
+
+
+if __name__ == "__main__":
+    argument = sys.argv[1:]
+    if '--resume_from_checkpoint' in argument:
+        evaluate()
+    else:
+        train()
+
