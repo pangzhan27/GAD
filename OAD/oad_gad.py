@@ -1,8 +1,8 @@
-## resemble naive "simple" implementation for sanity check
-## replace "\n Assistant: background" or "\n Assistant: action <eos>", still separate streaming and response during inference
+#* generate short-term actions(at most recent 1).
+# only for ct and edgo4dgoal
 from transformers import AutoTokenizer, HfArgumentParser, PreTrainedTokenizer, AutoModelForCausalLM, TrainerCallback, \
     Cache
-from transformers import Trainer, TrainingArguments, EvalPrediction, Qwen2Config
+from transformers import Trainer, TrainingArguments, LlamaConfig, EvalPrediction
 from transformers.trainer_pt_utils import LabelSmoother
 from dataclasses import asdict
 from functools import partial
@@ -17,7 +17,7 @@ import os, json, tqdm, time
 from torch.utils.data import ConcatDataset
 import Levenshtein
 from dataclasses import dataclass, field
-from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding #Qwen2ForCausalLM,
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 import random
 import sys
 sys.path.append('..')
@@ -25,23 +25,26 @@ sys.path.append('..')
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logger = logging.get_logger(__name__)
 
-from src.metrics import thumos_results, crosstask_results
+from src.metrics import thumos_results_new, crosstask_results_new, ek100_results_new, ego4dgoal_results_new
 from src.utils import DictWithTo, get_labels_start_end_time, uniform_sampler
 from src.trainer import TrainerWithTensorBoard, LengthGroupedSampler, VideoGroupedSampler
-from src.cls_llm import Qwen2ForCausalLM
-from src.metrics import thumos_results_new, crosstask_results_new, ek100_results_new, ego4dgoal_results_new
+from src.cls_llm import LlamaForCausalLM
 
 
 ####################################### Arguments
 @dataclass
 class LiveTrainingArguments(TrainingArguments):
     live_version: str = 'live1+'
-    system_prompt: str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-
+    system_prompt: str = (
+        "A multimodal AI assistant is helping users with some activities."
+        " Below is their conversation, interleaved with the list of video frames received by the assistant."
+    )
     train_datasets: list[str] = None
     eval_datasets: list[str] = None
     stream_loss_weight: float = 1.0
-    lora_modules: str = "model.*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
+    llm_pretrained: str = 'meta-llama/Llama-3.2-1B-Instruct'  # 'meta-llama/Meta-Llama-3-8B-Instruct'#
+    vision_pretrained: str = 'google/siglip-large-patch16-384'
+    lora_modules: str = "model.*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)|lm_head$"
     lora_r: int = 128
     lora_alpha: int = 256
     finetune_modules: list[str] = field(default_factory=lambda: ['connector'])
@@ -54,6 +57,8 @@ class LiveTrainingArguments(TrainingArguments):
     augmentation: bool = False
     attn_implementation: str = 'flash_attention_2'
     output_dir: str = 'outputs/debug'
+    text2visual_connector = '\n' #'\nStream:'
+    visual2text_connector = '<cls>\nAssistant: '
 
 
 @dataclass
@@ -68,10 +73,10 @@ class LiveOneTHUMOSTrainingArguments(LiveTrainingArguments):
     train_datasets: list[str] = field(default_factory=lambda: ['thumos_train'])
     eval_datasets: list[str] = field(default_factory=lambda: ['thumos_test'])
     stream_loss_weight: float = 1.0
-    llm_pretrained: str = 'Qwen/Qwen2.5-0.5B-Instruct'  # 'meta-llama/Meta-Llama-3-8B-Instruct'#
+    llm_pretrained: str = 'meta-llama/Llama-3.2-1B-Instruct'  # 'meta-llama/Meta-Llama-3-8B-Instruct'#
     vision_pretrained: str = 'resnet50'
     flow_pretrained: str = 'bninception'
-    lora_modules: str = "model.*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
+    lora_modules: str = "model.*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)|lm_head$"
     lora_r: int = 128
     lora_alpha: int = 256
     lora_dropout: float = 0.05
@@ -95,10 +100,12 @@ class LiveOneTHUMOSTrainingArguments(LiveTrainingArguments):
     test_no_cache: bool = False
     silence_threshold: float = 0.0
     head_dropout: float = 0.0
+    gen_cls_lmd: float = 1.0
+    short_shuffle: bool = False
 
 
 ####################################### configure
-class LiveQwenConfig(Qwen2Config):
+class LiveLlamaConfig(LlamaConfig):
     def __init__(self, *, vision_pretrained: str = None,
                  frame_resolution: int = None, frame_token_cls: bool = None, frame_token_pooled: list[int] = None,
                  frame_num_tokens: int = None,
@@ -125,12 +132,26 @@ class LiveQwenConfig(Qwen2Config):
 ##################################### data collator
 def data_collator(batch: list[list], *, tokenizer: PreTrainedTokenizer, **kwargs):
     batch = list(zip(*batch))
-    batch_text, batch_frames, batch_labels, batch_sample_idx, batch_evaluation_kwargs = batch
+    batch_text, batch_frames, batch_labels_cls, batch_learn_ranges, batch_sample_idx, batch_evaluation_kwargs = batch
     batch = tokenizer(batch_text, return_offsets_mapping=True, add_special_tokens=False, return_tensors="pt",
                       padding=True)
     # for j in batch['input_ids'][0, :]:
     #     print(j, repr(tokenizer.decode(j)))
-    batch['labels'] = torch.stack(batch_labels).long()
+    batch_labels = torch.full_like(batch.input_ids, LabelSmoother.ignore_index, dtype=torch.long)
+    for text, labels, input_ids, offset_mapping, learn_range in zip(
+            batch_text, batch_labels, batch.input_ids, batch.offset_mapping, batch_learn_ranges):
+        for learn_r in learn_range:
+            assert torch.max(offset_mapping[:, 0] == learn_r.start).int() > 0
+            start = torch.nonzero(offset_mapping[:, 0] == learn_r.start).item()
+            if offset_mapping[:, 0][-1] >= learn_r.stop:
+                stop = torch.nonzero(offset_mapping[:, 0] == learn_r.stop).item()
+            else:  # the last eos token
+                stop = len(input_ids)
+            labels[start - 1:stop - 1] = input_ids[start:stop]
+            labels[labels >= len(tokenizer) - 1] = tokenizer.eos_token_id
+
+    batch['gen_labels'] = batch_labels
+    batch['labels'] = torch.stack(batch_labels_cls).long()
     batch.pop('offset_mapping')
     num_frames = [len(frames) for frames in batch_frames]
     #print(num_frames)
@@ -146,7 +167,6 @@ def data_collator(batch: list[list], *, tokenizer: PreTrainedTokenizer, **kwargs
     if batch_evaluation_kwargs[0]:
         batch['evaluation_kwargs'] = batch_evaluation_kwargs[0]  # evaluation only supports bs = 1, so its okay
     return batch
-
 
 
 def get_data_collator(**kwargs):
@@ -174,6 +194,11 @@ class DataShuffleCallback(TrainerCallback):
             else:
                 time.sleep(60)
 
+        # if state.epoch > 0:
+        #     train_dataloader.dataset.shuffle()
+        #     if isinstance(train_dataloader.batch_sampler.sampler, LengthGroupedSampler) or \
+        #             isinstance(train_dataloader.batch_sampler.sampler, VideoGroupedSampler):
+        #         train_dataloader.batch_sampler.sampler.update_length(train_dataloader.dataset)
 
 
 
@@ -187,6 +212,7 @@ class StreamMixIn(torch.utils.data.Dataset):
         self.augmentation = augmentation
         self.tokenizer = tokenizer
         self.max_num_frames = max_num_frames
+        assert system_prompt is not None, 'Please add a system prompt'
 
     # NOTE: this augmentation is to reduce the text dependency
     def augment(self, conversation):
@@ -300,7 +326,7 @@ class THUMOWind_ls(THUMOS, StreamMixIn):
     sys_message = { "role": "system",  "content": 'What is the action in the last frame?'}
 
     def __init__(self, *, split: str, is_training: bool, short_len: int, short_sr: int, long_len: int, long_sr: int,
-                 stride: int, imbalance_ratio: float, **kwargs):
+                 stride: int, imbalance_ratio: float, short_shuffle: bool, **kwargs):
         super().__init__(split=split, is_training=is_training, **kwargs)
         self.is_training = is_training
         self.framelabel = self.get_framelabel()
@@ -310,9 +336,12 @@ class THUMOWind_ls(THUMOS, StreamMixIn):
         self.long_sample_rate = long_sr
         self.stride = stride
         self.imbalance_ratio = imbalance_ratio
+        self.gen_class = [THUMOS._clean_step(i) for i in self.classnames]
+        self.short_shuffle = short_shuffle
         self._init_dataset()
         self.total_num = len(self.annos)
         self.categories = self.step_categories
+
 
     def _init_dataset(self):
         self.count = 0
@@ -336,9 +365,14 @@ class THUMOWind_ls(THUMOS, StreamMixIn):
 
                 final_indices = np.concatenate((long_indices, work_indices))
                 response = int(sub_steps[-1])
-                conversation = [THUMOWind_ls.sys_message,
-                                {"role": "stream", 'num_frames': len(final_indices), 'learn': False}]
-
+                if response == 0:
+                    conversation = [THUMOWind_ls.sys_message,
+                                    {"role": "stream", 'num_frames': len(final_indices), 'learn': False},
+                                    {"role": "silence", "content": self.tokenizer.silence_token}]
+                else:
+                    conversation = [THUMOWind_ls.sys_message,
+                                    {"role": "stream", 'num_frames': len(final_indices), 'learn': False},
+                                    {"role": "assistant", "content": self.gen_class[response], 'learn': True}]
 
                 #############
                 text = self.tokenizer.apply_chat_template(conversation, tokenize=False,  add_generation_prompt=False)
@@ -396,10 +430,10 @@ class THUMOWind_ls(THUMOS, StreamMixIn):
                                                   add_generation_prompt=not self.is_training)
         # print(text)
         # 3. learn ranges
-        # learn_ranges = self.tokenizer.get_learn_ranges(conversation) if self.is_training else []
+        learn_ranges = self.tokenizer.get_learn_ranges(conversation) if self.is_training else []
         # for i in range(len(learn_ranges)):
         #     print(i, repr(text[learn_ranges[i].start: learn_ranges[i].stop]))
-        return text, rgb_frames, torch.tensor([label]).long(), index, self.evaluation_kwargs
+        return text, rgb_frames, torch.tensor([label]).long(), learn_ranges, index, self.evaluation_kwargs
 
     def shuffle(self):
         self._init_dataset()
@@ -520,7 +554,7 @@ class CrossTaskWind_ls(CrossTask, StreamMixIn):
     sys_message = { "role": "system",  "content": 'What is the action in the last frame?'}
 
     def __init__(self, *, split: str, is_training: bool, short_len: int, short_sr: int, long_len: int, long_sr: int,
-                 stride: int, imbalance_ratio: float, **kwargs):
+                 stride: int, imbalance_ratio: float, short_shuffle: bool, **kwargs):
         super().__init__(split=split, is_training=is_training, **kwargs)
         self.is_training = is_training
         self.framelabel = self.get_framelabel()
@@ -530,6 +564,8 @@ class CrossTaskWind_ls(CrossTask, StreamMixIn):
         self.long_sample_rate = long_sr
         self.stride = stride
         self.imbalance_ratio = imbalance_ratio
+        self.gen_class = [CrossTask._clean_step(i) for i in self.classnames]
+        self.short_shuffle = short_shuffle
         self._init_dataset()
         self.total_num = len(self.annos)
         self.categories = self.step_categories
@@ -556,9 +592,30 @@ class CrossTaskWind_ls(CrossTask, StreamMixIn):
 
                 final_indices = np.concatenate((long_indices, work_indices))
                 response = int(sub_steps[-1])
+                # get the label for the whole short-term, excluding bg and the current action.
+                past_actions, _, _ = get_labels_start_end_time(sub_steps, bg_class=[0])
+                past_actions = [k for k in past_actions if k != response and k != 0]
+                extra_response = ''
+                if len(past_actions) > 0:
+                    past_actions = [self.gen_class[i] for i in past_actions]
+                    past_actions = sorted(set(past_actions), key=past_actions.index)  # remove duplicate actions but keep order
+                    past_actions = past_actions[-1:]
+                    if self.short_shuffle:
+                        # random shuffle the action for agumentation, like just telling me what happend in the short-term, no need in order
+                        random.shuffle(past_actions)
+                    extra_response = ', '  # to concate with current response
+                    extra_response += ', '.join(past_actions)
 
-                conversation = [CrossTaskWind_ls.sys_message,
-                                {"role": "stream", 'num_frames': len(final_indices), 'learn': False}]
+                if response == 0:
+                    if len(extra_response) > 0:
+                        extra_response += self.tokenizer.eos_token
+                    conversation = [CrossTaskWind_ls.sys_message,
+                                    {"role": "stream", 'num_frames': len(final_indices), 'learn': False},
+                                    {"role": "silence", "content": self.tokenizer.silence_token + extra_response}]
+                else:
+                    conversation = [CrossTaskWind_ls.sys_message,
+                                    {"role": "stream", 'num_frames': len(final_indices), 'learn': False},
+                                    {"role": "assistant", "content": self.gen_class[response] + extra_response, 'learn': True}]
 
                 #############
                 text = self.tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
@@ -619,11 +676,11 @@ class CrossTaskWind_ls(CrossTask, StreamMixIn):
                                                   add_generation_prompt=not self.is_training)
         # print(text)
         # 3. learn ranges
-        # learn_ranges = self.tokenizer.get_learn_ranges(conversation) if self.is_training else []
+        learn_ranges = self.tokenizer.get_learn_ranges(conversation) if self.is_training else []
         # for i in range(len(learn_ranges)):
         #     print(i, repr(text[learn_ranges[i].start: learn_ranges[i].stop]))
 
-        return text, rgb_frames, torch.tensor([label]).long(), index, self.evaluation_kwargs
+        return text, rgb_frames, torch.tensor([label]).long(), learn_ranges, index, self.evaluation_kwargs
 
     def shuffle(self):
         self._init_dataset()
@@ -740,7 +797,7 @@ class EK100Wind_ls(EK100, StreamMixIn):
     sys_message = {"role": "system", "content": 'What is the action in the last frame?'}
 
     def __init__(self, *, split: str, is_training: bool, short_len: int, short_sr: int, long_len: int, long_sr: int,
-                 stride: int, imbalance_ratio: float, **kwargs):
+                 stride: int, imbalance_ratio: float, short_shuffle: bool, **kwargs):
         super().__init__(split=split, is_training=is_training, **kwargs)
         self.is_training = is_training
         self.framelabel = self.get_framelabel()
@@ -750,6 +807,8 @@ class EK100Wind_ls(EK100, StreamMixIn):
         self.long_sample_rate = long_sr
         self.stride = stride
         self.imbalance_ratio = imbalance_ratio
+        self.gen_class = [EK100._clean_step(i) for i in self.classnames]
+        self.short_shuffle = short_shuffle
         self._init_dataset()
         self.total_num = len(self.annos)
         self.categories = self.step_categories
@@ -776,9 +835,31 @@ class EK100Wind_ls(EK100, StreamMixIn):
 
                 final_indices = np.concatenate((long_indices, work_indices))
                 response = int(sub_steps[-1]) #sub_steps[-1].lower()
+                # get the label for the whole short-term, excluding bg and the current action.
+                past_actions, _, _ = get_labels_start_end_time(sub_steps, bg_class=[0])
+                past_actions = [k for k in past_actions if k != response and k != 0]
+                extra_response = ''
+                if len(past_actions) > 0:
+                    past_actions = [self.gen_class[i] for i in past_actions]
+                    past_actions = sorted(set(past_actions),
+                                          key=past_actions.index)  # remove duplicate actions but keep order
+                    past_actions = past_actions[-1:]
+                    if self.short_shuffle:
+                        # random shuffle the action for agumentation, like just telling me what happend in the short-term, no need in order
+                        random.shuffle(past_actions)
+                    extra_response = ', '  # to concate with current response
+                    extra_response += ', '.join(past_actions)
 
-                conversation = [EK100Wind_ls.sys_message,
-                                {"role": "stream", 'num_frames': len(final_indices), 'learn': False}]
+                if response == 0:
+                    if len(extra_response) > 0:
+                        extra_response += self.tokenizer.eos_token
+                    conversation = [EK100Wind_ls.sys_message,
+                                    {"role": "stream", 'num_frames': len(final_indices), 'learn': False},
+                                    {"role": "silence", "content": self.tokenizer.silence_token + extra_response}]
+                else:
+                    conversation = [EK100Wind_ls.sys_message,
+                                    {"role": "stream", 'num_frames': len(final_indices), 'learn': False},
+                                    {"role": "assistant", "content": self.gen_class[response] + extra_response, 'learn': True}]
 
                 #############
                 text = self.tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
@@ -840,11 +921,11 @@ class EK100Wind_ls(EK100, StreamMixIn):
                                                   add_generation_prompt=not self.is_training)
         # print(text)
         # 3. learn ranges
-        #learn_ranges = self.tokenizer.get_learn_ranges(conversation) if self.is_training else []
+        learn_ranges = self.tokenizer.get_learn_ranges(conversation) if self.is_training else []
         # for i in range(len(learn_ranges)):
         #     print(i, repr(text[learn_ranges[i].start: learn_ranges[i].stop]))
 
-        return text, rgb_frames, torch.tensor([label]).long(), index, self.evaluation_kwargs
+        return text, rgb_frames, torch.tensor([label]).long(), learn_ranges, index, self.evaluation_kwargs
 
     def shuffle(self):
         self._init_dataset()
@@ -965,7 +1046,7 @@ class Ego4DGoalWind_ls(Ego4DGoal, StreamMixIn):
     sys_message = {"role": "system", "content": 'What is the action in the last frame?'}
 
     def __init__(self, *, split: str, is_training: bool, short_len: int, short_sr: int, long_len: int, long_sr: int,
-                 stride: int, imbalance_ratio: float, **kwargs):
+                 stride: int, imbalance_ratio: float, short_shuffle: bool, **kwargs):
         super().__init__(split=split, is_training=is_training, **kwargs)
         self.is_training = is_training
         self.framelabel = self.get_framelabel()
@@ -975,6 +1056,8 @@ class Ego4DGoalWind_ls(Ego4DGoal, StreamMixIn):
         self.long_sample_rate = long_sr
         self.stride = stride
         self.imbalance_ratio = imbalance_ratio
+        self.gen_class = [Ego4DGoal._clean_step(i) for i in self.classnames]
+        self.short_shuffle = short_shuffle
         self._init_dataset()
         self.total_num = len(self.annos)
         self.categories = self.step_categories
@@ -1001,9 +1084,32 @@ class Ego4DGoalWind_ls(Ego4DGoal, StreamMixIn):
 
                 final_indices = np.concatenate((long_indices, work_indices))
                 response = int(sub_steps[-1])
-                conversation = [Ego4DGoalWind_ls.sys_message,
-                                {"role": "stream", 'num_frames': len(final_indices), 'learn': False}]
+                # get the label for the whole short-term, excluding bg and the current action.
+                past_actions, _, _ = get_labels_start_end_time(sub_steps, bg_class=[0])
+                past_actions = [k for k in past_actions if k != response and k != 0]
+                extra_response = ''
+                if len(past_actions) > 0:
+                    past_actions = [self.gen_class[i] for i in past_actions]
+                    past_actions = sorted(set(past_actions),
+                                          key=past_actions.index)  # remove duplicate actions but keep order
+                    past_actions = past_actions[-1:]
+                    if self.short_shuffle:
+                        # random shuffle the action for agumentation, like just telling me what happend in the short-term, no need in order
+                        random.shuffle(past_actions)
+                    extra_response = ', '  # to concate with current response
+                    extra_response += ', '.join(past_actions)
 
+
+                if response == 0:
+                    if len(extra_response) > 0:
+                        extra_response += self.tokenizer.eos_token
+                    conversation = [Ego4DGoalWind_ls.sys_message,
+                                    {"role": "stream", 'num_frames': len(final_indices), 'learn': False},
+                                    {"role": "silence", "content": self.tokenizer.silence_token  + extra_response }]
+                else:
+                    conversation = [Ego4DGoalWind_ls.sys_message,
+                                    {"role": "stream", 'num_frames': len(final_indices), 'learn': False},
+                                    {"role": "assistant", "content": self.gen_class[response]  + extra_response , 'learn': True}]
 
                 #############
                 text = self.tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
@@ -1066,11 +1172,11 @@ class Ego4DGoalWind_ls(Ego4DGoal, StreamMixIn):
                                                   add_generation_prompt=not self.is_training)
         # print(text)
         # 3. learn ranges
-        # learn_ranges = self.tokenizer.get_learn_ranges(conversation) if self.is_training else []
+        learn_ranges = self.tokenizer.get_learn_ranges(conversation) if self.is_training else []
         # for i in range(len(learn_ranges)):
         #     print(i, repr(text[learn_ranges[i].start: learn_ranges[i].stop]))
 
-        return text, rgb_frames, torch.tensor([label]).long(), index, self.evaluation_kwargs
+        return text, rgb_frames, torch.tensor([label]).long(), learn_ranges, index, self.evaluation_kwargs
 
     def shuffle(self):
         self._init_dataset()
@@ -1082,6 +1188,7 @@ def build_ego4dgoal_wind_ls(split='train', **kwargs):
     return Ego4DGoalWind_ls(split=split, **kwargs)
 
 
+
 def build_concat_train_dataset(train_datasets: list, is_training=True, **kwargs):
     if train_datasets is None or len(train_datasets) == 0:
         return None
@@ -1091,55 +1198,80 @@ def build_concat_train_dataset(train_datasets: list, is_training=True, **kwargs)
 
 
 ####################################### tokenizer
-def get_stream_placeholder_jinja2(model_config: LiveQwenConfig) -> str:
+def get_stream_placeholder_jinja2(model_config: LiveLlamaConfig) -> str:
     return f"'{model_config.frame_token_interval}'.join([{model_config.frame_num_tokens} * '{model_config.v_placeholder}'] * message['num_frames'])"
 
 
-def get_stream_placeholder_len(num_frames: int, model_config: LiveQwenConfig) -> str:
+def get_stream_placeholder_len(num_frames: int, model_config: LiveLlamaConfig) -> str:
     return num_frames * model_config.frame_num_tokens * len(model_config.v_placeholder) + len(
         model_config.frame_token_interval) * (num_frames - 1)
 
 
-def chat_template(self, stream_placeholder_jinja2: str):
+def get_stream_learn_ranges(num_frames: int, model_config: LiveLlamaConfig) -> torch.Tensor:
+    len_frame_placeholder_with_interval = model_config.frame_num_tokens * len(model_config.v_placeholder) + len(
+        model_config.frame_token_interval)
+    intermediate_interval_idxs = torch.arange(
+        len_frame_placeholder_with_interval,
+        len_frame_placeholder_with_interval * num_frames + 1,
+        len_frame_placeholder_with_interval
+    ) - len(model_config.frame_token_interval)
+    len_learn = len(model_config.frame_token_interval) if model_config.frame_token_interval else len(
+        model_config.v_placeholder)
+    learn_ranges = torch.stack([
+        intermediate_interval_idxs,
+        intermediate_interval_idxs + len_learn
+    ], dim=1)
+    return learn_ranges
+
+
+def chat_template(self, stream_placeholder_jinja2: str, text2visual_connector: str, visual2text_connector: str):
+    """
+    User: ...
+    Str<v><v><v><v><v><v><v>
+    'Assistant: aciton </s>' or '~'(no response/background)
+    """
     template = (
-        "{%- for message in messages %}"
-        "{%- if message.role == 'system' %}"
-        "{{- '<|im_start|>system\n' + message.content + '<|im_end|>\n' }}"
-        "{%- elif (message.role == 'user') or (message.role == 'system' and not loop.first ) %}"
-        "{{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}"
-        "{%- elif (message.role == 'silence') or (message.role == 'assistant') %}"
-        "{{- '<|im_start|>' + 'assistant' + '\n' + message.content + '<|im_end|>' + '\n' }}"
-        "{%- elif message.role == 'stream' %}"
-        "{{- '<|im_start|>' + message.role + '\n' + STREAM_PLACEHOLDER + '<cls>' + '<|im_end|>' + '\n' }}"
-        "{%- endif %}"
-        "{%- endfor %}"
-        "{%- if add_generation_prompt %}"
-        "{{- '<|im_start|>assistant\n' }}"
-        "{%- endif %}"
+        "{% if messages[0]['role'] == 'system' %}"
+        "{{ bos_token + messages[0]['content'] }}"  # system
+        "{% set messages = messages[1:] %}"
+        "{% endif %}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'assistant' %}"
+        "{{ V2T_PLACEHOLDER + message['content'] + eos_token }}"
+        "{% elif message['role'] == 'silence' %}"
+        "{{ V2TS_PLACEHOLDER + message['content']}}"
+        "{% elif message['role'] == 'stream' and message['num_frames'] >= 0: %}"
+        "{{ T2V_PLACEHOLDER + STREAM_PLACEHOLDER}}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{ V2TS_PLACEHOLDER}}"
+        "{% endif %}"
     )
     template = template.replace('STREAM_PLACEHOLDER', stream_placeholder_jinja2)
+    template = template.replace('V2T_PLACEHOLDER', f"'{visual2text_connector}'")
+    template = template.replace('V2TS_PLACEHOLDER', f"'{visual2text_connector[:-1]}'")  # remove the last white space' '
+    template = template.replace('T2V_PLACEHOLDER', f"'{text2visual_connector}'")
     return template
 
-def chat_template_transition(tokenizer):
+def chat_template_transition(tokenizer, text2visual_connector, visual2text_connector):
     return {
-        (None, 'system'): '<|im_start|>system\n',
-        (None, 'user'): '<|im_start|>user\n',
-        ('system', 'user'): '<|im_end|>\n' + '<|im_start|>user\n',
-        ('system', 'stream'): '<|im_end|>\n' + '<|im_start|>stream\n',
-        ('stream', 'assistant'): '<|im_end|>\n' + '<|im_start|>assistant\n',
-        ('stream', 'silence'): '<|im_end|>\n' + '<|im_start|>assistant\n',
-        ('user', 'stream'): '<|im_end|>\n' + '<|im_start|>stream\n',
-        'assistant': '<|im_start|>assistant\n',
-        'silence': '<|im_start|>assistant\n',
+        (None, 'system'): tokenizer.bos_token,
+        ('system', 'stream'): text2visual_connector,
+        ('stream', 'assistant'): visual2text_connector,
+        ('stream', 'silence'): visual2text_connector[:-1],
+        'assistant': visual2text_connector.replace('<cls>', ''),
         'eos_token': tokenizer.eos_token,
+        'silence': visual2text_connector[:-1].replace('<cls>', ''),
     }
 
-def chat_template_offsets(tokenizer):
-    return {k: len(v) for k, v in chat_template_transition(tokenizer).items()}
+
+def chat_template_offsets(tokenizer, text2visual_connector, visual2text_connector):
+    return {k: len(v) for k, v in chat_template_transition(tokenizer, text2visual_connector, visual2text_connector).items()}
 
 
 def get_learn_ranges(conversation: list[dict], *, chat_template_offsets: dict[tuple, int],
-                     model_config: LiveQwenConfig):
+                     model_config: LiveLlamaConfig):
     offset = 0
     learn_ranges = []
     last_role = None
@@ -1152,7 +1284,6 @@ def get_learn_ranges(conversation: list[dict], *, chat_template_offsets: dict[tu
             if message.get('learn', False):
                 ValueError('Not implemented learnable stream')
             offset += get_stream_placeholder_len(message['num_frames'], model_config)
-            offset += len('<cls>')
         else:
             if role == 'assistant':
                 if message.get('learn', False):
@@ -1197,11 +1328,11 @@ class LiveMixin(AutoModelForCausalLM):
                 past_key_values]
 
 
-class LiveQwenForCausalLM(Qwen2ForCausalLM, LiveMixin):
-    config_class = LiveQwenConfig
-    _keys_to_ignore_on_load_missing = ['vision_encoder', 'connector', 'cls_head', 'cls_emb']
+class LiveLlamaForCausalLM(LlamaForCausalLM, LiveMixin):
+    config_class = LiveLlamaConfig
+    _keys_to_ignore_on_load_missing = ['vision_encoder', 'connector', 'cls_head', 'cls_emb'] #  'lm_head'
 
-    def __init__(self, config: LiveQwenConfig):
+    def __init__(self, config: LiveLlamaConfig):
         super().__init__(config)
 
         self.connector = torch.nn.Sequential(
@@ -1257,7 +1388,6 @@ class LiveQwenForCausalLM(Qwen2ForCausalLM, LiveMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            dropout=self.dropout,
             **kwargs,
         )
 
@@ -1267,7 +1397,6 @@ class LiveQwenForCausalLM(Qwen2ForCausalLM, LiveMixin):
             cls_logits = self.dropout(cls_logits)
         cls_logits = self.cls_head(cls_logits)
         outputs.cls_logits = cls_logits
-
         if labels is not None:
             v_mask = labels == 0
             bg_mask = v_mask.sum(-1).clip(0, 1)
@@ -1280,13 +1409,26 @@ class LiveQwenForCausalLM(Qwen2ForCausalLM, LiveMixin):
                 cls_logits = torch.transpose(cls_logits, 1, 2)
                 loss = nn.functional.cross_entropy(cls_logits, labels, reduction='none')
                 tmpt_loss = loss.sum(dim=-1) / ((labels >= 0).sum(dim=-1) + 1e-8)
-                bg_loss = torch.sum(tmpt_loss * bg_mask) / (torch.sum(bg_mask) + 1e-8)
-                fg_loss = torch.sum(tmpt_loss * fg_mask) / (torch.sum(fg_mask) + 1e-8)
+                bg_loss = torch.sum(tmpt_loss*bg_mask)/(torch.sum(bg_mask) + 1e-8)
+                fg_loss = torch.sum(tmpt_loss*fg_mask)/(torch.sum(fg_mask) + 1e-8)
                 weight = bg_mask * self.config.stream_loss_weight + (1 - bg_mask)
-                loss = torch.mean(tmpt_loss * weight)
+                cls_loss = torch.mean(tmpt_loss*weight)
+
+                # generation loss
+                gen_logits = torch.transpose(outputs[0], 1, 2)
+                gen_loss = nn.functional.cross_entropy(gen_logits, gen_labels, reduction='none')
+                gen_tmpt_loss = gen_loss.sum(dim=-1) / ((gen_labels >= 0).sum(dim=-1) + 1e-8)
+                gen_bg_loss = torch.sum(gen_tmpt_loss * bg_mask) / (torch.sum(bg_mask) + 1e-8)
+                gen_fg_loss = torch.sum(gen_tmpt_loss * fg_mask) / (torch.sum(fg_mask) + 1e-8)
+                gen_loss = torch.mean(gen_tmpt_loss) #  * weight
+
+                ##
+                loss = cls_loss + self.config.gen_cls_lmd * gen_loss
+                bg_loss += self.config.gen_cls_lmd * gen_bg_loss
+                fg_loss += self.config.gen_cls_lmd * gen_fg_loss
 
         if not return_dict:
-            return (loss, bg_loss, fg_loss) + outputs[1:] if loss is not None else outputs  # , bg_loss, fg_loss
+            return (loss, cls_loss, self.config.gen_cls_lmd * gen_loss) + outputs[1:] if loss is not None else outputs  # , bg_loss, fg_loss
 
         outputs.loss = loss
         return outputs
@@ -1308,6 +1450,12 @@ def train(model, tokenizer, args):
 
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+
+    a = []
+    for param in list(model.named_parameters()):
+        if param[1].requires_grad:
+            a.append(param[0])
+    print(a)
 
     # build dataset
     train_dataset = build_concat_train_dataset(tokenizer=tokenizer, **asdict(args))
@@ -1336,7 +1484,6 @@ def train(model, tokenizer, args):
     trainer.save_model()
 
 
-###################################### inference
 class LiveInfer_nocache:
     def __init__(self, model, tokenizer, args, classnames) -> None:
         self.model, self.tokenizer = model, tokenizer
@@ -1366,11 +1513,11 @@ class LiveInfer_nocache:
                   'Simply set silence_threshold = 0 will disable the threshold-based inference model')
 
         # generation
-        self.system_prompt = '' #args.system_prompt
+        self.system_prompt = args.system_prompt
         self.generate_length = args.max_response_length
         self.inplace_output_ids = torch.zeros(1, self.generate_length, dtype=torch.long).to(self.device)
         self.eos_token_id = self.model.config.eos_token_id
-        self.rotary_emb = Qwen2RotaryEmbedding(config=self.model.config)
+        self.rotary_emb = LlamaRotaryEmbedding(config=self.model.config)
 
         if 'crosstask' in args.train_datasets[0]:
             sys_prompt = CrossTaskWind_ls.sys_message
@@ -1383,17 +1530,15 @@ class LiveInfer_nocache:
         else:
             raise ValueError("Please provide the correct dataset names!!")
 
-        self._sys_ids_tot = self.tokenizer.apply_chat_template([sys_prompt,
+        self._sys_ids = self.tokenizer.apply_chat_template([sys_prompt,
                                                             {"role": "stream", 'num_frames': 0, 'learn': False}],
                                                          return_tensors='pt').to(self.device)
 
-        self._sys_ids = self._sys_ids_tot[:,:-3]
-        self._added_generation_ids = self._sys_ids_tot[:, -3:]
+        self._added_generation_ids = self.tokenizer.apply_chat_template([{}], add_generation_prompt=True,
+                                                                        return_tensors='pt').to(self.device)
+
         self._eos_ids = torch.tensor([[self.eos_token_id]]).to(self._added_generation_ids.dtype).to(self.device)
         self._cls_emd = self.model.cls_emb.weight.unsqueeze(0).to(self.device)
-
-        # for j in self._sys_ids[0, :]:
-        #     print(j, repr(tokenizer.decode(j)))
 
         self.conversations = []
         self.classnames = classnames
@@ -1402,16 +1547,12 @@ class LiveInfer_nocache:
     def _call_for_response(self, ):
         while self.frame_embeds_queue:
             video_time, frame_index, frame_embeds = self.frame_embeds_queue.popleft()
-
             inputs_embeds = torch.cat([
                 self.model.get_input_embeddings()(self._sys_ids).view(1, -1, self.hidden_size),
-                frame_embeds.view(1, -1, self.hidden_size),
-                self.model.get_input_embeddings()(self._added_generation_ids).view(1, -1, self.hidden_size), ], dim=1)
+                frame_embeds.view(1, -1, self.hidden_size), self._cls_emd], dim=1)
 
-            emb_index = torch.tensor([self._sys_ids.shape[1] + frame_embeds.shape[0]]).long()
-            inputs_embeds[:, emb_index, :] = self._cls_emd
+            emb_index = torch.tensor([inputs_embeds.shape[1] - 1]).long()
             outputs = self.model(inputs_embeds=inputs_embeds, past_key_values=None, use_cache=False, emb_index = emb_index)
-
             # decide
             next_score = outputs.cls_logits[:, 0, :].softmax(dim=-1)
             self.last_ids = next_score.argmax(dim=-1)
@@ -1461,6 +1602,7 @@ class LiveInfer_nocache:
         response, out_label = self._call_for_response()
         assert out_label is not None
         return response, out_label
+
 
 def load_videos_and_gt_thumos(phase='test'):
     root = '../datasets/thumos14'
@@ -1685,7 +1827,8 @@ def evalutate(model, tokenizer, args):
         with open(os.path.join(pred_path, sess + '.txt'), 'w') as f:
             f.write('%-60s %-20s %-20s %-20s\n' % ('Response', 'Prediction', 'Matched', 'GT'))
             for i1, j1, k1, s1 in vid_result:
-                f.write('%-60s %-20s %-20s %-20s\n' % (i1, j1, k1, s1))
+                f.write('%-60s \t %-20s \t %-20s \t %-20s\n' % (i1, j1, k1, s1))
+        
 
         # reset the liveinfer for the next video
         liveinfer.reset()
@@ -1718,12 +1861,11 @@ def evalutate(model, tokenizer, args):
                           bg='background', extra_dict=extra_dict)
 
 
-
 if __name__ == '__main__':
     args, = HfArgumentParser(LiveOneTHUMOSTrainingArguments).parse_args_into_dataclasses()
 
     ## build model
-    config_class, model_class = LiveQwenConfig, LiveQwenForCausalLM
+    config_class, model_class = LiveLlamaConfig, LiveLlamaForCausalLM
     config_class = config_class.from_pretrained(args.llm_pretrained, **asdict(args))
     config_class.visual_dim = args.visual_dim
     config_class.dropout = args.head_dropout
@@ -1738,7 +1880,6 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained(args.llm_pretrained, use_fast=True, padding_side='left')
     tokenizer.add_special_tokens({'additional_special_tokens': [model.config.v_placeholder, '<cls>']})
     v_placeholder_id, emb_id = len(tokenizer) - 2, len(tokenizer) - 1
-    #model.vocab_size = tokenizer.vocab_size
 
     assert model.config.silence_token, "You MUST provide a token to represent 'silence'"
     silence_token_id = int(tokenizer(model.config.silence_token, return_offsets_mapping=True, add_special_tokens=False, return_tensors="pt")[
@@ -1746,11 +1887,10 @@ if __name__ == '__main__':
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.silence_token = args.silence_token
     model.config.update(dict(v_placeholder_id=v_placeholder_id, eos_token_id=tokenizer.eos_token_id, silence_token_id=silence_token_id,
-             emb_id=emb_id))
-    # check_tokenization(tokenizer)
-
-    tokenizer.chat_template = chat_template(tokenizer, get_stream_placeholder_jinja2(model.config))
-    tokenizer.get_learn_ranges = partial(get_learn_ranges, chat_template_offsets=chat_template_offsets(tokenizer), model_config=model.config)
+                             emb_id = emb_id, gen_cls_lmd = args.gen_cls_lmd))
+    tokenizer.chat_template = chat_template(tokenizer, get_stream_placeholder_jinja2(model.config), args.text2visual_connector, args.visual2text_connector)
+    tokenizer.get_learn_ranges = partial(get_learn_ranges, chat_template_offsets=chat_template_offsets(tokenizer, args.text2visual_connector, args.visual2text_connector),
+                                         model_config=model.config)
 
     if args.test:
         evalutate(model, tokenizer, args)
